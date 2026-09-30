@@ -84,9 +84,9 @@ enumerates one unless asked:
 
 | | options | why |
 |---|---|---|
-| `YTDL_PROBE` | `playlist_items: "1"` | classify the query + get entry 1. **0.8s vs 7.2s** — fast enough to answer in-band |
-| `YTDL_SOLO` | `noplaylist: True` | the one song the user linked (see below) |
-| `YTDL_REST` | `playlist_items: "2:"` | the remainder, fetched *after* playback starts |
+| `YTDL_PROBE` | `playlist_items: "1"` | classify the query + confirm non-empty. **0.8s vs 7.1s** — fast enough to answer in-band |
+| `YTDL_SOLO` | `noplaylist: True` | the one song the link points at (see below) |
+| `YTDL_FULL` | — | the whole playlist, enumerated *after* playback starts |
 | `YTDL_STREAM` | — | per-track stream URL at play time |
 
 **`is_playlist()` keys on the extractor, not `_type`.** A plain text search also
@@ -94,11 +94,24 @@ reports `_type == "playlist"` (verified), so testing `_type` alone would pop the
 prompt on every ordinary song search. `youtube:search` vs `youtube:tab` is the
 real discriminator.
 
-**`noplaylist` is load-bearing for "just one song".** For a
-`watch?v=X&list=Y` URL — what you get copying a song from *inside* a playlist —
-yt-dlp resolves to the playlist and hands back **item 1, not video X**
-(verified). `YTDL_SOLO` avoids playing a different song than the one pasted, and
-still returns item 1 for a bare `playlist?list=` URL, so one path covers both.
+**`noplaylist` is load-bearing.** For a `watch?v=X&list=Y` URL — what you get
+copying a song from *inside* a playlist — yt-dlp resolves to the playlist and
+hands back **item 1, not video X** (verified). `YTDL_SOLO` is how both buttons
+find the track the link actually points at, and it still returns item 1 for a
+bare `playlist?list=` URL, so `PlaylistPrompt._start_track` covers both shapes
+with one call.
+
+**Playlists queue from the linked song, not from entry 1.** `load_rest` locates
+the start track by `vid` in the full enumeration and appends only what follows
+it, so pasting song 40 of a playlist queues 40→N the way YouTube behaves. It
+does *not* wrap around to 1–39. If the id isn't found it falls back to entry 1
+onward.
+
+**`tracks_from` prefers `webpage_url` over `url`, and the order matters.** On a
+fully extracted video `url` is the direct googlevideo stream carrying an
+`expire=` timestamp, which would rot while the track waits in the queue; flat
+playlist entries are the reverse — no `webpage_url`, watch link in `url`. Each
+track also keeps `vid` (yt-dlp's video id) so `load_rest` can find its position.
 
 **What `/play` does.** Playlists prompt via `PlaylistPrompt`; everything else
 goes straight through. `Music.enqueue(..., ahead=)` is the single place the
@@ -113,10 +126,10 @@ add/play rules live — `ahead=True` means one explicitly requested song:
 path calls `enqueue` with just entry 1 so music can start, and inferring would
 wrongly insert it ahead of tracks already pending.
 
-`load_rest` then appends entries 2…N while that first track plays. It re-checks
-`self.players.get(guild.id) is p` afterwards so a `/exit` mid-load drops the
-late arrivals, and restarts playback if the first track finished before the rest
-landed.
+`load_rest` then appends the remaining entries while that first track plays. It
+re-checks `self.players.get(guild.id) is p` afterwards so a `/exit` mid-load
+drops the late arrivals, and restarts playback if the first track finished
+before the rest landed (measured: 2.5s to music vs 8.7s on a 1620-track list).
 
 Two invariants make this work, and both are easy to break:
 

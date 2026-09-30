@@ -27,8 +27,9 @@ YTDL_PROBE = yt_dlp.YoutubeDL({**YTDL_OPTS, "playlist_items": "1"})
 # so a link copied from inside a playlist resolves to that video rather than
 # the playlist's first item; a bare playlist URL still yields its first item.
 YTDL_SOLO = yt_dlp.YoutubeDL({**YTDL_OPTS, "noplaylist": True, "playlist_items": "1"})
-# Everything after the first entry, fetched once playback is already going.
-YTDL_REST = yt_dlp.YoutubeDL({**YTDL_OPTS, "playlist_items": "2:"})
+# The whole playlist, enumerated once playback is already going. Unsliced because
+# the starting point is dynamic: a link naming a song starts the queue there.
+YTDL_FULL = yt_dlp.YoutubeDL(YTDL_OPTS)
 YTDL_STREAM = yt_dlp.YoutubeDL(
     {"format": "bestaudio/best", "quiet": True, "no_warnings": True}
 )
@@ -40,7 +41,11 @@ def tracks_from(info: dict) -> list[dict]:
     for e in info.get("entries") or [info]:
         if not e:
             continue
-        url = e.get("url") or e.get("webpage_url")
+        # webpage_url first: on a fully extracted video `url` is the direct
+        # googlevideo stream, which carries an expiry and would rot while the
+        # track sits in the queue. Flat playlist entries have no webpage_url and
+        # put the watch link in `url`, so the fallback covers them.
+        url = e.get("webpage_url") or e.get("url")
         if not url and e.get("id"):
             url = f"https://www.youtube.com/watch?v={e['id']}"
         if not url:
@@ -49,6 +54,8 @@ def tracks_from(info: dict) -> list[dict]:
             {
                 # Stable handle for the queue UI: positions shift, ids don't.
                 "id": uuid.uuid4().hex,
+                # yt-dlp's own video id, used to locate this track in a playlist.
+                "vid": e.get("id"),
                 "title": e.get("title") or "Unknown",
                 "url": url,
             }
@@ -75,14 +82,12 @@ class PlaylistPrompt(discord.ui.View):
     playlist is never enumerated unless the user actually asks for it.
     """
 
-    def __init__(self, cog: "Music", user_id: int, query: str, title: str,
-                 first: list[dict]):
+    def __init__(self, cog: "Music", user_id: int, query: str, title: str):
         super().__init__(timeout=60)
         self.cog = cog
         self.user_id = user_id  # only the requester may answer
         self.query = query
         self.title = title
-        self.first = first  # playlist entry 1, already extracted by the probe
         self.msg: discord.Message | None = None  # set once sent, for on_timeout
         for label, style, cb in (
             ("Add entire playlist", discord.ButtonStyle.primary, self.on_all),
@@ -123,34 +128,45 @@ class PlaylistPrompt(discord.ui.View):
         except discord.HTTPException:
             pass  # deleted, or the token expired on a very long load
 
-    async def on_all(self, interaction: discord.Interaction):
-        await self._claim(interaction, f"Loading **{self.title}**…")
-        # Entry 1 first so playback can start now; the rest follows while it plays.
-        await self.cog.enqueue(interaction.guild, self.first, ahead=False)
-        try:
-            rest = await self.cog.load_rest(interaction.guild, self.query)
-        except Exception as err:
-            print(f"Playlist load failed for {self.query!r}: {err}")
-            return await self._say(
-                interaction,
-                f"Queued **{len(self.first)}** track from **{self.title}** — "
-                "couldn't load the rest.",
-            )
-        total = len(self.first) + rest
-        await self._say(
-            interaction, f"Queued **{total}** tracks from **{self.title}**."
-        )
-
-    async def on_one(self, interaction: discord.Interaction):
-        await self._claim(interaction, "Loading…")
+    async def _start_track(self) -> list[dict]:
+        """The single track the link points at — the video it names, or the
+        playlist's first entry when it names none. `noplaylist` yields exactly
+        that in both cases, so both buttons start from the same place.
+        """
         try:
             info = await asyncio.to_thread(
                 YTDL_SOLO.extract_info, self.query, download=False
             )
-            tracks = tracks_from(info)[:1]
+            return tracks_from(info)[:1]
         except Exception as err:
             print(f"Extraction failed for {self.query!r}: {err}")
-            tracks = []
+            return []
+
+    async def on_all(self, interaction: discord.Interaction):
+        await self._claim(interaction, f"Loading **{self.title}**…")
+        # Queue that one track first so playback starts now; the remainder of the
+        # playlist is enumerated afterwards, while it plays.
+        start = await self._start_track()
+        if not start:
+            return await self._say(interaction, "Couldn't load that playlist.")
+        await self.cog.enqueue(interaction.guild, start, ahead=False)
+        try:
+            rest = await self.cog.load_rest(
+                interaction.guild, self.query, start[0].get("vid")
+            )
+        except Exception as err:
+            print(f"Playlist load failed for {self.query!r}: {err}")
+            return await self._say(
+                interaction,
+                f"Queued **1** track from **{self.title}** — couldn't load the rest.",
+            )
+        await self._say(
+            interaction, f"Queued **{1 + rest}** tracks from **{self.title}**."
+        )
+
+    async def on_one(self, interaction: discord.Interaction):
+        await self._claim(interaction, "Loading…")
+        tracks = await self._start_track()
         if not tracks:
             return await self._say(interaction, "Couldn't load that song.")
         started = await self.cog.enqueue(interaction.guild, tracks, ahead=True)
@@ -365,17 +381,27 @@ class Music(commands.Cog):
             await self.play_index(guild, p.index + 1)
         return idle
 
-    async def load_rest(self, guild: discord.Guild, query: str) -> int:
-        """Append a playlist's entries after the first, returning how many.
+    async def load_rest(
+        self, guild: discord.Guild, query: str, start_vid: str | None
+    ) -> int:
+        """Append the playlist entries that follow `start_vid`, returning how many.
 
-        Runs after playback has already started on entry 1, so a few-hundred
-        song playlist enumerates while music plays instead of before it.
+        Runs after playback already started on that track, so a long playlist
+        enumerates while music plays instead of before it. Slicing from the
+        linked song rather than from entry 1 keeps the order the link implied:
+        paste song 40 of a playlist and you get 40 onward, as YouTube does.
         """
         p = self.player(guild.id)
-        info = await asyncio.to_thread(YTDL_REST.extract_info, query, download=False)
+        info = await asyncio.to_thread(YTDL_FULL.extract_info, query, download=False)
         if self.players.get(guild.id) is not p:
             return 0  # /exit or a guild removal landed while we were loading
         tracks = tracks_from(info)
+        # Falls back to 0 (i.e. start at entry 1) if the track isn't in the list.
+        at = next(
+            (n for n, t in enumerate(tracks) if start_vid and t.get("vid") == start_vid),
+            0,
+        )
+        tracks = tracks[at + 1 :]
         if not tracks:
             return 0
         p.queue.extend(tracks)
@@ -407,11 +433,10 @@ class Music(commands.Cog):
         if not info:
             return await interaction.followup.send("No results found.")
         if is_playlist(info):
-            first = tracks_from(info)
-            if not first:
+            if not tracks_from(info):
                 return await interaction.followup.send("That playlist looks empty.")
             title = (info.get("title") or "Playlist")[:100]
-            view = PlaylistPrompt(self, interaction.user.id, query, title, first)
+            view = PlaylistPrompt(self, interaction.user.id, query, title)
             view.msg = await interaction.followup.send(
                 f"**{title}** is a playlist. Add all of it, or just one song?",
                 view=view,
