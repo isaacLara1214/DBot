@@ -73,10 +73,63 @@ so playback starts can interleave:
    same moment each reach `vc.play()` → `ClientException: Already playing
    audio.` plus a dropped track.
 2. The queue UI addresses tracks by `track["id"]` (a uuid set in
-   `extract_tracks`), never by position — `QueueView.selected` is an id, and
+   `tracks_from`), never by position — `QueueView.selected` is an id, and
    `Player.find()` resolves it at click time. Positions shift under a view as
    the queue is edited or advances, so a stored index silently targets the
    wrong track.
+
+**Four yt-dlp instances, each for one job.** A playlist can hold thousands of
+entries (1619 in one measured case, 7.2s to enumerate), so `/play` never
+enumerates one unless asked:
+
+| | options | why |
+|---|---|---|
+| `YTDL_PROBE` | `playlist_items: "1"` | classify the query + get entry 1. **0.8s vs 7.2s** — fast enough to answer in-band |
+| `YTDL_SOLO` | `noplaylist: True` | the one song the user linked (see below) |
+| `YTDL_REST` | `playlist_items: "2:"` | the remainder, fetched *after* playback starts |
+| `YTDL_STREAM` | — | per-track stream URL at play time |
+
+**`is_playlist()` keys on the extractor, not `_type`.** A plain text search also
+reports `_type == "playlist"` (verified), so testing `_type` alone would pop the
+prompt on every ordinary song search. `youtube:search` vs `youtube:tab` is the
+real discriminator.
+
+**`noplaylist` is load-bearing for "just one song".** For a
+`watch?v=X&list=Y` URL — what you get copying a song from *inside* a playlist —
+yt-dlp resolves to the playlist and hands back **item 1, not video X**
+(verified). `YTDL_SOLO` avoids playing a different song than the one pasted, and
+still returns item 1 for a bare `playlist?list=` URL, so one path covers both.
+
+**What `/play` does.** Playlists prompt via `PlaylistPrompt`; everything else
+goes straight through. `Music.enqueue(..., ahead=)` is the single place the
+add/play rules live — `ahead=True` means one explicitly requested song:
+
+| | nothing playing | already playing/paused |
+|---|---|---|
+| single song (`ahead=True`) | **inserted at `index + 1` and played now** | appended, nothing interrupted |
+| playlist (`ahead=False`) | appended; playback starts at `index + 1` | appended, nothing interrupted |
+
+`ahead` must not be inferred from `len(tracks) == 1`: the "add entire playlist"
+path calls `enqueue` with just entry 1 so music can start, and inferring would
+wrongly insert it ahead of tracks already pending.
+
+`load_rest` then appends entries 2…N while that first track plays. It re-checks
+`self.players.get(guild.id) is p` afterwards so a `/exit` mid-load drops the
+late arrivals, and restarts playback if the first track finished before the rest
+landed.
+
+Two invariants make this work, and both are easy to break:
+
+- **A single song is `insert`ed, not appended.** Appending and then playing it
+  would walk `index` *past* anything still pending, and both view layers filter
+  relative to the index — `queue_embed` uses `p.index <= i`, `QueueView` uses
+  `i > p.index` — so those tracks would vanish from `/queue` and `/next`
+  entirely. Inserting keeps them after the index and reachable.
+- **Playback always starts at `index + 1`, never `len(queue)`.** `index` points
+  at the current/last-played track, so `index + 1` is the oldest *unplayed* one:
+  the song just inserted, or whatever was already pending for a playlist. When
+  the queue has played through, `index + 1` already equals the first appended
+  track, so one expression covers every case without a branch.
 
 **Playback flow**: `/play` extracts track metadata with a flat, non-streaming
 `yt_dlp.YoutubeDL` (`YTDL_FLAT`, fast — handles search terms, single videos,

@@ -26,12 +26,12 @@ docker compose up -d --build
 
 | Command | Does |
 |---|---|
-| `/play <query>` | Song name (YouTube search), video link, or playlist link. Playlists append to the queue. |
+| `/play <query>` | Song name (YouTube search), video link, or playlist link. A single song plays straight away if nothing is playing, otherwise it joins the end of the queue. A **playlist link asks first**: add the whole playlist, or just the one song you linked. Playlists never interrupt what's already playing. |
 | `/queue` | Show queue; move, remove, or clear tracks via buttons. |
 | `/next` / `/back` | Skip forward / back. |
 | `/replay` | Restart the current song. |
 | `/pause` / `/resume` | Pause / resume. |
-| `/stop` | Leave voice, keep the queue. |
+| `/stop` | Leave voice, keep the queue (`/play` resumes it). |
 | `/clear` | Clear the queue. |
 | `/exit` | Leave voice and clear the queue. |
 

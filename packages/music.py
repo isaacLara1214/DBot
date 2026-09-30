@@ -1,5 +1,4 @@
 import asyncio
-import functools
 import uuid
 
 import discord
@@ -13,22 +12,30 @@ FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
 }
-YTDL_FLAT = yt_dlp.YoutubeDL(
-    {
-        "format": "bestaudio/best",
-        "quiet": True,
-        "no_warnings": True,
-        "default_search": "ytsearch1",
-        "extract_flat": "in_playlist",
-    }
-)
+YTDL_OPTS = {
+    "format": "bestaudio/best",
+    "quiet": True,
+    "no_warnings": True,
+    "default_search": "ytsearch1",
+    "extract_flat": "in_playlist",
+}
+# Classifies the query and grabs its first entry. Capped to one entry because a
+# few-hundred-song playlist takes seconds to enumerate in full (~0.3s vs ~1.9s
+# measured), and we need to answer the user before that finishes.
+YTDL_PROBE = yt_dlp.YoutubeDL({**YTDL_OPTS, "playlist_items": "1"})
+# The one song the user actually linked. `noplaylist` ignores a &list= wrapper,
+# so a link copied from inside a playlist resolves to that video rather than
+# the playlist's first item; a bare playlist URL still yields its first item.
+YTDL_SOLO = yt_dlp.YoutubeDL({**YTDL_OPTS, "noplaylist": True, "playlist_items": "1"})
+# Everything after the first entry, fetched once playback is already going.
+YTDL_REST = yt_dlp.YoutubeDL({**YTDL_OPTS, "playlist_items": "2:"})
 YTDL_STREAM = yt_dlp.YoutubeDL(
     {"format": "bestaudio/best", "quiet": True, "no_warnings": True}
 )
 
 
-def extract_tracks(query: str) -> list[dict]:
-    info = YTDL_FLAT.extract_info(query, download=False)
+def tracks_from(info: dict) -> list[dict]:
+    """Queue entries from a yt-dlp result, skipping anything unplayable."""
     tracks = []
     for e in info.get("entries") or [info]:
         if not e:
@@ -47,6 +54,108 @@ def extract_tracks(query: str) -> list[dict]:
             }
         )
     return tracks
+
+
+def is_playlist(info: dict) -> bool:
+    """Whether a probe result is a real playlist worth prompting about.
+
+    A plain text search also reports `_type == "playlist"`, so that alone would
+    fire the prompt on every ordinary song search. The extractor is what tells
+    them apart: `youtube:search` for searches, `youtube:tab` for playlists.
+    """
+    return info.get("_type") == "playlist" and "search" not in (
+        info.get("extractor") or ""
+    )
+
+
+class PlaylistPrompt(discord.ui.View):
+    """Asks whether a playlist link means the whole playlist or a single song.
+
+    Only the first entry is known at this point (see YTDL_PROBE), so the whole
+    playlist is never enumerated unless the user actually asks for it.
+    """
+
+    def __init__(self, cog: "Music", user_id: int, query: str, title: str,
+                 first: list[dict]):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.user_id = user_id  # only the requester may answer
+        self.query = query
+        self.title = title
+        self.first = first  # playlist entry 1, already extracted by the probe
+        self.msg: discord.Message | None = None  # set once sent, for on_timeout
+        for label, style, cb in (
+            ("Add entire playlist", discord.ButtonStyle.primary, self.on_all),
+            ("Just one song", discord.ButtonStyle.secondary, self.on_one),
+        ):
+            btn = discord.ui.Button(label=label, style=style)
+            btn.callback = cb
+            self.add_item(btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message(
+            "Only whoever ran /play can answer this.", ephemeral=True
+        )
+        return False
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.msg:
+            try:
+                await self.msg.edit(
+                    content=f"**{self.title}** — timed out, nothing added.", view=self
+                )
+            except discord.HTTPException:
+                pass  # message gone; nothing to grey out
+
+    async def _claim(self, interaction: discord.Interaction, note: str):
+        """Answer the click and drop the buttons. Must happen before any
+        extraction: Discord discards an interaction unanswered after 3s."""
+        self.stop()
+        await interaction.response.edit_message(content=note, view=None)
+
+    async def _say(self, interaction: discord.Interaction, content: str):
+        try:
+            await interaction.edit_original_response(content=content)
+        except discord.HTTPException:
+            pass  # deleted, or the token expired on a very long load
+
+    async def on_all(self, interaction: discord.Interaction):
+        await self._claim(interaction, f"Loading **{self.title}**…")
+        # Entry 1 first so playback can start now; the rest follows while it plays.
+        await self.cog.enqueue(interaction.guild, self.first, ahead=False)
+        try:
+            rest = await self.cog.load_rest(interaction.guild, self.query)
+        except Exception as err:
+            print(f"Playlist load failed for {self.query!r}: {err}")
+            return await self._say(
+                interaction,
+                f"Queued **{len(self.first)}** track from **{self.title}** — "
+                "couldn't load the rest.",
+            )
+        total = len(self.first) + rest
+        await self._say(
+            interaction, f"Queued **{total}** tracks from **{self.title}**."
+        )
+
+    async def on_one(self, interaction: discord.Interaction):
+        await self._claim(interaction, "Loading…")
+        try:
+            info = await asyncio.to_thread(
+                YTDL_SOLO.extract_info, self.query, download=False
+            )
+            tracks = tracks_from(info)[:1]
+        except Exception as err:
+            print(f"Extraction failed for {self.query!r}: {err}")
+            tracks = []
+        if not tracks:
+            return await self._say(interaction, "Couldn't load that song.")
+        started = await self.cog.enqueue(interaction.guild, tracks, ahead=True)
+        verb = "Playing" if started else "Queued"
+        await self._say(interaction, f"{verb} **{tracks[0]['title']}**")
 
 
 class QueueView(discord.ui.View):
@@ -162,7 +271,9 @@ class Music(commands.Cog):
         if not p.queue:
             return discord.Embed(title="Queue", description="The queue is empty.")
         lines = [
-            f"{i + 1}. {'▶ ' if i == p.index else ''}{t['title']}"
+            # Titles come from yt-dlp; cap them so 25 of them can't overrun
+            # Discord's 4096-char embed description limit.
+            f"{i + 1}. {'▶ ' if i == p.index else ''}{t['title'][:100]}"
             for i, t in enumerate(p.queue)
             if p.index <= i < p.index + 25
         ]
@@ -187,18 +298,16 @@ class Music(commands.Cog):
                     return
                 if vc.is_playing() or vc.is_paused():
                     return  # another start got there first; don't double up
+                track = p.queue[i]  # hold a ref; the queue may be edited mid-await
                 p.index = i
                 try:
-                    info = await asyncio.get_running_loop().run_in_executor(
-                        None,
-                        functools.partial(
-                            YTDL_STREAM.extract_info, p.queue[i]["url"], download=False
-                        ),
+                    info = await asyncio.to_thread(
+                        YTDL_STREAM.extract_info, track["url"], download=False
                     )
                     url = info["url"]
                 except (yt_dlp.utils.DownloadError, KeyError) as err:
                     # Unavailable / private / geo-blocked: move on, don't stall.
-                    print(f"Skipping {p.queue[i]['title']}: {err}")
+                    print(f"Skipping {track['title']}: {err}")
                     i += 1
                     continue
                 vc.play(discord.FFmpegPCMAudio(url, **FFMPEG_OPTS), after=after)
@@ -220,12 +329,62 @@ class Music(commands.Cog):
             return await interaction.response.send_message(
                 "I'm not in a voice channel — use /play to start."
             )
+        # Reply first: Discord drops an interaction with no response inside 3s,
+        # and play_index below can spend longer than that resolving a stream.
+        await interaction.response.send_message(ok_msg)
         if vc.is_playing() or vc.is_paused():
             self.player(interaction.guild_id).jump = i
             vc.stop()  # after-callback fires advance(), which honours the jump
         else:
             await self.play_index(interaction.guild, i)
-        await interaction.response.send_message(ok_msg)
+
+    async def enqueue(
+        self, guild: discord.Guild, tracks: list[dict], *, ahead: bool
+    ) -> bool:
+        """Add tracks and start playback if nothing is playing. Returns whether
+        playback started as a result.
+
+        `ahead` marks one explicitly requested song: when idle it is inserted at
+        index + 1 so it plays now. Appending instead would walk the index past
+        anything still pending, and both view layers filter on the index
+        (`queue_embed` uses `p.index <= i`, `QueueView` uses `i > p.index`), so
+        those tracks would vanish from /queue and /next. Playlists pass
+        ahead=False and always append, leaving pending tracks in front of them.
+        """
+        p = self.player(guild.id)
+        vc = guild.voice_client
+        idle = bool(vc) and not (vc.is_playing() or vc.is_paused())
+        if ahead and idle:
+            p.queue.insert(p.index + 1, tracks[0])
+        else:
+            p.queue.extend(tracks)
+        if idle:
+            # index + 1 is the oldest unplayed track: what was just inserted,
+            # or whatever was already pending. On a played-through queue it is
+            # the first appended track, so one expression covers every case.
+            await self.play_index(guild, p.index + 1)
+        return idle
+
+    async def load_rest(self, guild: discord.Guild, query: str) -> int:
+        """Append a playlist's entries after the first, returning how many.
+
+        Runs after playback has already started on entry 1, so a few-hundred
+        song playlist enumerates while music plays instead of before it.
+        """
+        p = self.player(guild.id)
+        info = await asyncio.to_thread(YTDL_REST.extract_info, query, download=False)
+        if self.players.get(guild.id) is not p:
+            return 0  # /exit or a guild removal landed while we were loading
+        tracks = tracks_from(info)
+        if not tracks:
+            return 0
+        p.queue.extend(tracks)
+        vc = guild.voice_client
+        if vc and not (vc.is_playing() or vc.is_paused()):
+            # Entry 1 can finish before a long playlist finishes loading, which
+            # leaves advance() having found an empty queue. Restart from here.
+            await self.play_index(guild, p.index + 1)
+        return len(tracks)
 
     @app_commands.command(description="Play a song, YouTube link, or playlist link")
     @app_commands.describe(query="Song name, YouTube video link, or playlist link")
@@ -237,27 +396,34 @@ class Music(commands.Cog):
                 return await interaction.followup.send("Join a voice channel first.")
             vc = await interaction.user.voice.channel.connect()
         try:
-            tracks = await asyncio.get_running_loop().run_in_executor(
-                None, extract_tracks, query
+            info = await asyncio.to_thread(
+                YTDL_PROBE.extract_info, query, download=False
             )
         except Exception as err:
             # Broad on purpose: the interaction is deferred, so any escaping
             # exception would leave the user staring at "thinking…" forever.
             print(f"Extraction failed for {query!r}: {err}")
-            tracks = []
+            info = None
+        if not info:
+            return await interaction.followup.send("No results found.")
+        if is_playlist(info):
+            first = tracks_from(info)
+            if not first:
+                return await interaction.followup.send("That playlist looks empty.")
+            title = (info.get("title") or "Playlist")[:100]
+            view = PlaylistPrompt(self, interaction.user.id, query, title, first)
+            view.msg = await interaction.followup.send(
+                f"**{title}** is a playlist. Add all of it, or just one song?",
+                view=view,
+                wait=True,  # without this followup.send returns None
+            )
+            return
+        tracks = tracks_from(info)
         if not tracks:
             return await interaction.followup.send("No results found.")
-        p = self.player(interaction.guild_id)
-        start = len(p.queue)
-        p.queue.extend(tracks)
-        if not (vc.is_playing() or vc.is_paused()):
-            await self.play_index(interaction.guild, start)
-        msg = (
-            f"Queued **{tracks[0]['title']}**"
-            if len(tracks) == 1
-            else f"Queued **{len(tracks)}** tracks"
-        )
-        await interaction.followup.send(msg)
+        started = await self.enqueue(interaction.guild, tracks, ahead=True)
+        verb = "Playing" if started else "Queued"
+        await interaction.followup.send(f"{verb} **{tracks[0]['title']}**")
 
     @app_commands.command(description="Show the queue and move or remove tracks")
     async def queue(self, interaction: discord.Interaction):
