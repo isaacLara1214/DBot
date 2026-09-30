@@ -1,0 +1,11 @@
+# Dockerfile does `COPY . .` — keep secrets and junk out of the image layers.
+# NB: unlike .gitignore, these patterns are NOT applied at every directory
+# level, so nested matches need an explicit `**/` prefix.
+.env
+.git/
+.gitignore
+.claude/
+.DS_Store
+CLAUDE.md
+**/__pycache__/
+**/*.py[cod]

@@ -1,10 +1,13 @@
 import asyncio
 import functools
+import uuid
 
 import discord
 import yt_dlp
 from discord import app_commands
 from discord.ext import commands
+
+from player import Player
 
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -26,64 +29,33 @@ YTDL_STREAM = yt_dlp.YoutubeDL(
 
 def extract_tracks(query: str) -> list[dict]:
     info = YTDL_FLAT.extract_info(query, download=False)
-    entries = info.get("entries") or [info]
-    return [
-        {
-            "title": e.get("title") or "Unknown",
-            "url": e.get("url")
-            or e.get("webpage_url")
-            or f"https://www.youtube.com/watch?v={e['id']}",
-        }
-        for e in entries
-        if e
-    ]
-
-
-class Player:
-    """Per-guild queue. Played tracks stay in the list so /back and /replay work;
-    index points at the current track."""
-
-    def __init__(self):
-        self.queue: list[dict] = []
-        self.index = -1
-        self.jump: int | None = None
-
-    @property
-    def current(self):
-        return self.queue[self.index] if 0 <= self.index < len(self.queue) else None
-
-    def step(self) -> int | None:
-        """Next index to play when a track ends (honours a pending jump)."""
-        i = self.jump if self.jump is not None else self.index + 1
-        self.jump = None
-        return i if 0 <= i < len(self.queue) else None
-
-    def clear(self):
-        cur = self.current
-        self.queue = [cur] if cur else []
-        self.index = 0 if cur else -1
-        self.jump = None
-
-    def move(self, i: int, delta: int) -> bool:
-        j = i + delta
-        if self.index < min(i, j) and max(i, j) < len(self.queue):
-            self.queue[i], self.queue[j] = self.queue[j], self.queue[i]
-            return True
-        return False
-
-    def remove(self, i: int) -> bool:
-        if self.index < i < len(self.queue):
-            self.queue.pop(i)
-            return True
-        return False
+    tracks = []
+    for e in info.get("entries") or [info]:
+        if not e:
+            continue
+        url = e.get("url") or e.get("webpage_url")
+        if not url and e.get("id"):
+            url = f"https://www.youtube.com/watch?v={e['id']}"
+        if not url:
+            continue  # nothing playable; skip rather than queue a bad entry
+        tracks.append(
+            {
+                # Stable handle for the queue UI: positions shift, ids don't.
+                "id": uuid.uuid4().hex,
+                "title": e.get("title") or "Unknown",
+                "url": url,
+            }
+        )
+    return tracks
 
 
 class QueueView(discord.ui.View):
-    def __init__(self, cog: "Music", guild: discord.Guild, selected: int | None = None):
+    def __init__(self, cog: "Music", guild: discord.Guild, selected: str | None = None):
         super().__init__(timeout=180)
         self.cog = cog
         self.guild = guild
-        self.selected = selected
+        self.selected = selected  # track id, not a position
+        self.msg: discord.Message | None = None  # set once sent, for on_timeout
         p = cog.player(guild.id)
         upcoming = [(i, t) for i, t in enumerate(p.queue) if i > p.index][:25]
         if upcoming:
@@ -92,8 +64,8 @@ class QueueView(discord.ui.View):
                 options=[
                     discord.SelectOption(
                         label=f"{i + 1}. {t['title']}"[:100],
-                        value=str(i),
-                        default=i == selected,
+                        value=t["id"],
+                        default=t["id"] == selected,
                     )
                     for i, t in upcoming
                 ],
@@ -109,23 +81,50 @@ class QueueView(discord.ui.View):
         clear.callback = self.on_clear
         self.add_item(clear)
 
+    async def on_timeout(self):
+        """Grey the controls out instead of leaving buttons that look live but
+        answer with "This interaction failed"."""
+        for item in self.children:
+            item.disabled = True
+        if self.msg:
+            try:
+                await self.msg.edit(view=self)
+            except discord.HTTPException:
+                pass  # message gone; nothing to grey out
+
     async def refresh(self, interaction: discord.Interaction, selected=None):
+        view = QueueView(self.cog, self.guild, selected)
+        view.msg = self.msg
         await interaction.response.edit_message(
-            embed=self.cog.queue_embed(self.guild.id),
-            view=QueueView(self.cog, self.guild, selected),
+            embed=self.cog.queue_embed(self.guild.id), view=view
         )
+        self.stop()  # superseded: its timeout must not overwrite the new view
 
     async def on_select(self, interaction: discord.Interaction):
-        await self.refresh(interaction, int(interaction.data["values"][0]))
+        await self.refresh(interaction, interaction.data["values"][0])
 
-    async def _move(self, interaction, delta):
+    async def _resolve(self, interaction) -> int | None:
+        """Position of the selected track right now, or None (with a reply sent)
+        if nothing is selected or it left the queue since this view was built."""
         if self.selected is None:
-            return await interaction.response.send_message(
+            await interaction.response.send_message(
                 "Select a track first.", ephemeral=True
             )
-        p = self.cog.player(self.guild.id)
-        moved = p.move(self.selected, delta)
-        await self.refresh(interaction, self.selected + delta if moved else self.selected)
+            return None
+        i = self.cog.player(self.guild.id).find(self.selected)
+        if i is None:
+            await interaction.response.send_message(
+                "That track is no longer in the queue.", ephemeral=True
+            )
+        return i
+
+    async def _move(self, interaction, delta):
+        i = await self._resolve(interaction)
+        if i is None:
+            return
+        self.cog.player(self.guild.id).move(i, delta)
+        # Selection follows the track by id, so it survives the reorder.
+        await self.refresh(interaction, self.selected)
 
     async def on_up(self, interaction):
         await self._move(interaction, -1)
@@ -134,11 +133,10 @@ class QueueView(discord.ui.View):
         await self._move(interaction, 1)
 
     async def on_remove(self, interaction):
-        if self.selected is None:
-            return await interaction.response.send_message(
-                "Select a track first.", ephemeral=True
-            )
-        self.cog.player(self.guild.id).remove(self.selected)
+        i = await self._resolve(interaction)
+        if i is None:
+            return
+        self.cog.player(self.guild.id).remove(i)
         await self.refresh(interaction)
 
     async def on_clear(self, interaction):
@@ -155,6 +153,10 @@ class Music(commands.Cog):
     def player(self, guild_id: int) -> Player:
         return self.players.setdefault(guild_id, Player())
 
+    @commands.Cog.listener()
+    async def on_guild_remove(self, guild: discord.Guild):
+        self.players.pop(guild.id, None)
+
     def queue_embed(self, guild_id: int) -> discord.Embed:
         p = self.player(guild_id)
         if not p.queue:
@@ -170,22 +172,37 @@ class Music(commands.Cog):
         return discord.Embed(title="Queue", description="\n".join(lines))
 
     async def play_index(self, guild: discord.Guild, i: int):
+        """Play queue index i, skipping tracks yt-dlp can't resolve."""
         p = self.player(guild.id)
-        vc = guild.voice_client
-        if not vc or not (0 <= i < len(p.queue)):
-            return
-        p.index = i
-        info = await asyncio.get_running_loop().run_in_executor(
-            None,
-            functools.partial(YTDL_STREAM.extract_info, p.queue[i]["url"], download=False),
-        )
 
         def after(err):
             if err:
                 print(f"Player error: {err}")
             asyncio.run_coroutine_threadsafe(self.advance(guild), self.bot.loop)
 
-        vc.play(discord.FFmpegPCMAudio(info["url"], **FFMPEG_OPTS), after=after)
+        async with p.lock:
+            while 0 <= i < len(p.queue):
+                vc = guild.voice_client
+                if not vc or not vc.is_connected():
+                    return
+                if vc.is_playing() or vc.is_paused():
+                    return  # another start got there first; don't double up
+                p.index = i
+                try:
+                    info = await asyncio.get_running_loop().run_in_executor(
+                        None,
+                        functools.partial(
+                            YTDL_STREAM.extract_info, p.queue[i]["url"], download=False
+                        ),
+                    )
+                    url = info["url"]
+                except (yt_dlp.utils.DownloadError, KeyError) as err:
+                    # Unavailable / private / geo-blocked: move on, don't stall.
+                    print(f"Skipping {p.queue[i]['title']}: {err}")
+                    i += 1
+                    continue
+                vc.play(discord.FFmpegPCMAudio(url, **FFMPEG_OPTS), after=after)
+                return
 
     async def advance(self, guild: discord.Guild):
         vc = guild.voice_client
@@ -195,14 +212,20 @@ class Music(commands.Cog):
         if i is not None:
             await self.play_index(guild, i)
 
-    async def skip_to(self, guild: discord.Guild, i: int):
-        p = self.player(guild.id)
-        vc = guild.voice_client
-        if vc and (vc.is_playing() or vc.is_paused()):
-            p.jump = i
+    async def _jump(self, interaction: discord.Interaction, i: int, ok_msg: str):
+        """Jump to queue index i, or say why we can't. /stop leaves the queue
+        intact but drops the voice client, so there is nothing to jump in."""
+        vc = interaction.guild.voice_client
+        if not vc:
+            return await interaction.response.send_message(
+                "I'm not in a voice channel — use /play to start."
+            )
+        if vc.is_playing() or vc.is_paused():
+            self.player(interaction.guild_id).jump = i
             vc.stop()  # after-callback fires advance(), which honours the jump
         else:
-            await self.play_index(guild, i)
+            await self.play_index(interaction.guild, i)
+        await interaction.response.send_message(ok_msg)
 
     @app_commands.command(description="Play a song, YouTube link, or playlist link")
     @app_commands.describe(query="Song name, YouTube video link, or playlist link")
@@ -217,7 +240,10 @@ class Music(commands.Cog):
             tracks = await asyncio.get_running_loop().run_in_executor(
                 None, extract_tracks, query
             )
-        except yt_dlp.utils.DownloadError:
+        except Exception as err:
+            # Broad on purpose: the interaction is deferred, so any escaping
+            # exception would leave the user staring at "thinking…" forever.
+            print(f"Extraction failed for {query!r}: {err}")
             tracks = []
         if not tracks:
             return await interaction.followup.send("No results found.")
@@ -235,34 +261,32 @@ class Music(commands.Cog):
 
     @app_commands.command(description="Show the queue and move or remove tracks")
     async def queue(self, interaction: discord.Interaction):
+        view = QueueView(self, interaction.guild)
         await interaction.response.send_message(
-            embed=self.queue_embed(interaction.guild_id),
-            view=QueueView(self, interaction.guild),
+            embed=self.queue_embed(interaction.guild_id), view=view
         )
+        view.msg = await interaction.original_response()
 
     @app_commands.command(description="Skip to the next song")
     async def next(self, interaction: discord.Interaction):
         p = self.player(interaction.guild_id)
         if p.index + 1 >= len(p.queue):
             return await interaction.response.send_message("Nothing left in the queue.")
-        await self.skip_to(interaction.guild, p.index + 1)
-        await interaction.response.send_message("Skipped.")
+        await self._jump(interaction, p.index + 1, "Skipped.")
 
     @app_commands.command(description="Skip back to the previous song")
     async def back(self, interaction: discord.Interaction):
         p = self.player(interaction.guild_id)
         if p.index <= 0:
             return await interaction.response.send_message("No previous song.")
-        await self.skip_to(interaction.guild, p.index - 1)
-        await interaction.response.send_message("Playing previous song.")
+        await self._jump(interaction, p.index - 1, "Playing previous song.")
 
     @app_commands.command(description="Replay the current song from the start")
     async def replay(self, interaction: discord.Interaction):
         p = self.player(interaction.guild_id)
         if not p.current:
             return await interaction.response.send_message("Nothing is playing.")
-        await self.skip_to(interaction.guild, p.index)
-        await interaction.response.send_message(f"Replaying **{p.current['title']}**.")
+        await self._jump(interaction, p.index, f"Replaying **{p.current['title']}**.")
 
     @app_commands.command(description="Pause the music")
     async def pause(self, interaction: discord.Interaction):
