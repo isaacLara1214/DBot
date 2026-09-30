@@ -144,13 +144,44 @@ Two invariants make this work, and both are easy to break:
   the queue has played through, `index + 1` already equals the first appended
   track, so one expression covers every case without a branch.
 
-**Playback flow**: `/play` extracts track metadata with a flat, non-streaming
-`yt_dlp.YoutubeDL` (`YTDL_FLAT`, fast — handles search terms, single videos,
-and playlists) and appends to the queue. Actual playback resolves the
-streamable URL lazily per-track with a second `YoutubeDL` instance
-(`YTDL_STREAM`) right before `vc.play()`, since flat extraction doesn't give
-a directly playable stream URL. Both extractions run in an executor
-(`run_in_executor`) since `yt_dlp` is blocking.
+**Stream URLs are resolved per-track, late.** The queue stores watch-page links;
+`YTDL_STREAM` turns one into a playable URL immediately before `vc.play()`.
+Resolving up front would not survive a long queue — googlevideo URLs carry an
+`expire=` timestamp. Every `yt_dlp` call goes through `asyncio.to_thread`, since
+the library is blocking.
+
+**Now-playing panel** (`NowPlaying` + `Music.panels`, one per guild). Differs
+from `QueueView` in two ways that matter:
+
+- **`timeout=None`.** It must stay usable as long as the bot is in voice, so it
+  cannot expire on its own. `close_panel` is what retires it, which is also what
+  keeps views from leaking.
+- **Buttons are built once; `sync(guild)` re-points them** (toggle icon/label,
+  per-edge disabling) before each redraw. `QueueView` rebuilds instead because
+  its option list changes; here the five controls are fixed, so mutating in place
+  avoids the stop-and-replace dance.
+
+`ensure_panel(guild, channel)` posts the panel if the guild hasn't got one and
+redraws it otherwise, so the panel appears by itself as soon as the bot joins
+voice. It is called from all three `/play` paths (plain `/play`, and both
+`PlaylistPrompt` buttons) — in the "add entire playlist" case *before*
+`load_rest`, or the panel would be held back by the whole enumeration. It
+swallows send failures: no Send Messages permission should cost the panel, not
+the music. `/nowplaying` stays useful for re-posting the panel once chat has
+scrolled past it, and retires the previous one so only ever one is live.
+
+`refresh_panel` is called wherever displayed state changes: a new track in
+`play_index`, the queue running dry in `advance`, `/pause`, `/resume`, `/clear`,
+and `QueueView.refresh` (which can change "Up next"). **It must never raise** —
+it runs from the FFmpeg `after` callback path, where an exception lands in an
+un-awaited Future and silently kills the queue, so it swallows and logs instead.
+
+`on_voice_state_update` closes the panel when the bot leaves voice. Every exit
+routes through it — `/stop`, `/exit`, a moderator disconnect, a deleted channel —
+so no per-command cleanup is needed.
+
+Panel buttons and slash commands share `Music.jump_to(guild, i)`; `_jump` is just
+the interaction-aware wrapper that replies first (3s window) and delegates.
 
 **Queue UI**: `/queue` renders a `discord.Embed` plus a `QueueView`
 (`discord.ui.View`) with a track select + move/remove/clear buttons. Every
@@ -168,3 +199,43 @@ across that rebuild, or the view breaks subtly:
 Create `packages/<name>.py` with a Cog and an `async def setup(bot):
 await bot.add_cog(YourCog(bot))`. It will be picked up automatically; no
 changes to `bot.py` are needed.
+
+## TODO
+
+**Commit tests for `packages/music.py`.** Coverage is currently inverted: the
+stable file is tested, the volatile one is not.
+
+```
+player.py          7 methods,  20 assertions   <- tested
+packages/music.py  ~40 methods,  0 assertions  <- 521 lines, untested
+```
+
+Everything reworked recently lives in the untested file — `enqueue`'s `ahead=`
+rules, `load_rest`'s slice-from-linked-song, `tracks_from`'s watch-URL
+preference, `is_playlist`, all of `PlaylistPrompt`, `play_index`'s lock and
+dead-track skip, `_jump`'s reply-first ordering, `QueueView._resolve`.
+
+Two things to do:
+
+1. **Add `test_play.py`** covering at minimum: `/play` for search / single video
+   / playlist; both prompt buttons idle and mid-song; a playlist yielding to
+   already-pending tracks; slicing when the link names a song partway through;
+   the linked id being absent or last; wrong-user click refused; prompt timeout
+   queueing nothing; `load_rest` failing partway; the first track ending
+   mid-load; `/exit` during a load dropping late arrivals; `tracks_from`
+   rejecting the expiring googlevideo URL.
+2. **Rename `test_music.py` → `test_player.py`** (it imports `player`, not
+   `music` — the name currently implies coverage that does not exist) and update
+   the reference in README.md and in the Commands section above.
+
+Tests must run with no dependencies installed, like `test_music.py` does.
+`packages/music.py` imports `discord` and `yt_dlp` at module level, so
+`test_play.py` needs to stub those in `sys.modules` before importing it —
+`discord.ui.View` and `commands.Cog` have to be real classes (they get
+subclassed); the rest can be `MagicMock`/`SimpleNamespace`. Fakes worth building
+once: a voice client that raises if `play()` is called while already playing
+(that assertion is what catches accidental interruptions), and an interaction
+recording `followup`/`edit_original_response` calls.
+
+Each of these listed cases has caught a real bug during development, so they are
+regression guards, not coverage theater.

@@ -50,6 +50,12 @@ def tracks_from(info: dict) -> list[dict]:
             url = f"https://www.youtube.com/watch?v={e['id']}"
         if not url:
             continue  # nothing playable; skip rather than queue a bad entry
+        # Flat entries carry a `thumbnails` list; a full extraction has a single
+        # `thumbnail` string. Both shapes reach here.
+        thumb = e.get("thumbnail")
+        if not thumb:
+            thumbs = e.get("thumbnails") or []
+            thumb = thumbs[-1].get("url") if thumbs else None
         tracks.append(
             {
                 # Stable handle for the queue UI: positions shift, ids don't.
@@ -58,9 +64,23 @@ def tracks_from(info: dict) -> list[dict]:
                 "vid": e.get("id"),
                 "title": e.get("title") or "Unknown",
                 "url": url,
+                # Display-only, for the now-playing panel. Free: both the flat
+                # and the full extraction already return them.
+                "duration": e.get("duration"),
+                "uploader": e.get("uploader") or e.get("channel"),
+                "thumb": thumb,
             }
         )
     return tracks
+
+
+def fmt_duration(seconds) -> str:
+    """m:ss, or h:mm:ss past the hour. Live streams report no duration."""
+    if not seconds:
+        return "—"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
 
 
 def is_playlist(info: dict) -> bool:
@@ -150,6 +170,9 @@ class PlaylistPrompt(discord.ui.View):
         if not start:
             return await self._say(interaction, "Couldn't load that playlist.")
         await self.cog.enqueue(interaction.guild, start, ahead=False)
+        # Before load_rest, not after: a long playlist would hold the panel back
+        # by however many seconds the enumeration takes.
+        await self.cog.ensure_panel(interaction.guild, interaction.channel)
         try:
             rest = await self.cog.load_rest(
                 interaction.guild, self.query, start[0].get("vid")
@@ -172,6 +195,108 @@ class PlaylistPrompt(discord.ui.View):
         started = await self.cog.enqueue(interaction.guild, tracks, ahead=True)
         verb = "Playing" if started else "Queued"
         await self._say(interaction, f"{verb} **{tracks[0]['title']}**")
+        await self.cog.ensure_panel(interaction.guild, interaction.channel)
+
+
+class NowPlaying(discord.ui.View):
+    """Playback controls for the current track. One per guild, held in
+    `Music.panels`.
+
+    `timeout=None` on purpose: the panel must stay usable for as long as the bot
+    is in voice, however long that is. `Music.close_panel` retires it instead,
+    which is what stops this from leaking views. Buttons are built once and
+    `sync()` re-points them at current state, so a redraw never swaps the view.
+    """
+
+    def __init__(self, cog: "Music", guild_id: int):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.msg: discord.Message | None = None
+        self.prev = discord.ui.Button(emoji="⏮", label="Prev")
+        self.toggle = discord.ui.Button(emoji="⏸", label="Pause")
+        self.nxt = discord.ui.Button(emoji="⏭", label="Next")
+        self.again = discord.ui.Button(emoji="🔁", label="Replay")
+        self.leave = discord.ui.Button(
+            emoji="⏹", label="Stop", style=discord.ButtonStyle.danger
+        )
+        for btn, cb in (
+            (self.prev, self.on_prev),
+            (self.toggle, self.on_toggle),
+            (self.nxt, self.on_next),
+            (self.again, self.on_replay),
+            (self.leave, self.on_stop),
+        ):
+            btn.callback = cb
+            self.add_item(btn)
+
+    def sync(self, guild: discord.Guild):
+        """Re-point the controls at current state. Call before every redraw."""
+        p = self.cog.player(self.guild_id)
+        vc = guild.voice_client
+        paused = bool(vc) and vc.is_paused()
+        live = bool(vc) and (vc.is_playing() or paused)
+        self.toggle.emoji = "▶" if paused else "⏸"
+        self.toggle.label = "Resume" if paused else "Pause"
+        self.toggle.disabled = not live
+        self.prev.disabled = p.index <= 0
+        self.nxt.disabled = p.index + 1 >= len(p.queue)
+        self.again.disabled = p.current is None
+        self.leave.disabled = vc is None
+
+    # Each handler answers the click, then lets the resulting playback change
+    # drive the redraw — jump_to routes through play_index, which refreshes.
+    # Preconditions are re-checked here because a stale panel can still be
+    # clicked even with the button disabled.
+    async def on_prev(self, interaction: discord.Interaction):
+        p = self.cog.player(self.guild_id)
+        if p.index <= 0:
+            return await interaction.response.send_message(
+                "No previous song.", ephemeral=True
+            )
+        await interaction.response.defer()
+        await self.cog.jump_to(interaction.guild, p.index - 1)
+
+    async def on_next(self, interaction: discord.Interaction):
+        p = self.cog.player(self.guild_id)
+        if p.index + 1 >= len(p.queue):
+            return await interaction.response.send_message(
+                "Nothing left in the queue.", ephemeral=True
+            )
+        await interaction.response.defer()
+        await self.cog.jump_to(interaction.guild, p.index + 1)
+
+    async def on_replay(self, interaction: discord.Interaction):
+        p = self.cog.player(self.guild_id)
+        if not p.current:
+            return await interaction.response.send_message(
+                "Nothing is playing.", ephemeral=True
+            )
+        await interaction.response.defer()
+        await self.cog.jump_to(interaction.guild, p.index)
+
+    async def on_toggle(self, interaction: discord.Interaction):
+        vc = interaction.guild.voice_client
+        if vc and vc.is_paused():
+            vc.resume()
+        elif vc and vc.is_playing():
+            vc.pause()
+        else:
+            return await interaction.response.send_message(
+                "Nothing is playing.", ephemeral=True
+            )
+        await interaction.response.defer()
+        await self.cog.refresh_panel(interaction.guild)
+
+    async def on_stop(self, interaction: discord.Interaction):
+        vc = interaction.guild.voice_client
+        if not vc:
+            return await interaction.response.send_message(
+                "I'm not in a voice channel.", ephemeral=True
+            )
+        await interaction.response.defer()
+        # on_voice_state_update closes the panel once the disconnect lands.
+        await vc.disconnect()
 
 
 class QueueView(discord.ui.View):
@@ -224,6 +349,7 @@ class QueueView(discord.ui.View):
             embed=self.cog.queue_embed(self.guild.id), view=view
         )
         self.stop()  # superseded: its timeout must not overwrite the new view
+        await self.cog.refresh_panel(self.guild)  # "Up next" may have changed
 
     async def on_select(self, interaction: discord.Interaction):
         await self.refresh(interaction, interaction.data["values"][0])
@@ -274,6 +400,7 @@ class Music(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.players: dict[int, Player] = {}
+        self.panels: dict[int, NowPlaying] = {}
 
     def player(self, guild_id: int) -> Player:
         return self.players.setdefault(guild_id, Player())
@@ -281,6 +408,101 @@ class Music(commands.Cog):
     @commands.Cog.listener()
     async def on_guild_remove(self, guild: discord.Guild):
         self.players.pop(guild.id, None)
+        self.panels.pop(guild.id, None)
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member: discord.Member, before, after):
+        """Retire the panel when the bot leaves voice. Every exit routes through
+        here — /stop, /exit, a moderator disconnect, a deleted channel — so this
+        is the one place that needs to handle it."""
+        if self.bot.user and member.id == self.bot.user.id:
+            if before.channel and not after.channel:
+                await self.close_panel(member.guild)
+
+    def panel_embed(self, guild: discord.Guild) -> discord.Embed:
+        p = self.player(guild.id)
+        vc = guild.voice_client
+        cur = p.current
+        left = len(p.queue) - p.index - 1
+        if not cur:
+            return discord.Embed(
+                title="⏹ Nothing playing",
+                description=(
+                    f"**{left}** track(s) still queued — press ⏭ to start one."
+                    if left > 0
+                    else "The queue is empty. Use `/play` to add something."
+                ),
+            )
+        state = "⏸ Paused" if (vc and vc.is_paused()) else "▶ Now playing"
+        embed = discord.Embed(
+            title=cur["title"][:256],
+            url=cur.get("url"),
+            description=f"{state} · {fmt_duration(cur.get('duration'))}",
+        )
+        if cur.get("uploader"):
+            embed.add_field(name="Uploader", value=cur["uploader"][:1024])
+        embed.add_field(name="Track", value=f"{p.index + 1} of {len(p.queue)}")
+        if left > 0:
+            nxt = p.queue[p.index + 1]
+            embed.add_field(
+                name="Up next",
+                value=f"{nxt['title'][:80]} · {fmt_duration(nxt.get('duration'))}",
+                inline=False,
+            )
+        embed.set_footer(text=f"{left} track(s) left in the queue")
+        if cur.get("thumb"):
+            embed.set_thumbnail(url=cur["thumb"])
+        return embed
+
+    async def ensure_panel(self, guild: discord.Guild, channel):
+        """Post the now-playing panel if this guild hasn't got one, else redraw.
+
+        Called from every /play path so the panel shows up as soon as the bot
+        joins voice. Swallows send failures — a missing Send Messages permission
+        should cost you the panel, not the music.
+        """
+        if guild.id in self.panels:
+            return await self.refresh_panel(guild)
+        view = NowPlaying(self, guild.id)
+        view.sync(guild)
+        try:
+            view.msg = await channel.send(embed=self.panel_embed(guild), view=view)
+        except Exception as err:
+            print(f"Could not post the now-playing panel: {err}")
+            return
+        self.panels[guild.id] = view
+
+    async def refresh_panel(self, guild: discord.Guild):
+        """Redraw the panel if one is open.
+
+        Never raises. This is called from playback paths — including via the
+        FFmpeg `after` callback — where an exception would land in a Future
+        nobody awaits and silently end the queue.
+        """
+        panel = self.panels.get(guild.id)
+        if not panel or not panel.msg:
+            return
+        panel.sync(guild)
+        try:
+            await panel.msg.edit(embed=self.panel_embed(guild), view=panel)
+        except Exception as err:
+            print(f"Panel refresh failed: {err}")
+
+    async def close_panel(self, guild: discord.Guild, note: str = "I left the voice channel."):
+        """Retire the panel: controls removed, final state shown."""
+        panel = self.panels.pop(guild.id, None)
+        if not panel:
+            return
+        panel.stop()
+        if not panel.msg:
+            return
+        try:
+            await panel.msg.edit(
+                embed=discord.Embed(title="⏹ Playback ended", description=note),
+                view=None,
+            )
+        except Exception as err:
+            print(f"Panel close failed: {err}")
 
     def queue_embed(self, guild_id: int) -> discord.Embed:
         p = self.player(guild_id)
@@ -327,32 +549,47 @@ class Music(commands.Cog):
                     i += 1
                     continue
                 vc.play(discord.FFmpegPCMAudio(url, **FFMPEG_OPTS), after=after)
+                await self.refresh_panel(guild)  # new track on screen
                 return
+        # Fell off the end of the queue without playing anything.
+        await self.refresh_panel(guild)
 
     async def advance(self, guild: discord.Guild):
         vc = guild.voice_client
         if not vc or not vc.is_connected():
             return
         i = self.player(guild.id).step()
-        if i is not None:
+        if i is None:
+            await self.refresh_panel(guild)  # queue ran out; show the idle state
+            return
+        await self.play_index(guild, i)
+
+    async def jump_to(self, guild: discord.Guild, i: int) -> bool:
+        """Move playback to queue index i. False if we aren't connected.
+
+        Shared by the slash commands and the now-playing buttons.
+        """
+        vc = guild.voice_client
+        if not vc:
+            return False
+        if vc.is_playing() or vc.is_paused():
+            self.player(guild.id).jump = i
+            vc.stop()  # after-callback fires advance(), which honours the jump
+        else:
             await self.play_index(guild, i)
+        return True
 
     async def _jump(self, interaction: discord.Interaction, i: int, ok_msg: str):
         """Jump to queue index i, or say why we can't. /stop leaves the queue
         intact but drops the voice client, so there is nothing to jump in."""
-        vc = interaction.guild.voice_client
-        if not vc:
+        if not interaction.guild.voice_client:
             return await interaction.response.send_message(
                 "I'm not in a voice channel — use /play to start."
             )
         # Reply first: Discord drops an interaction with no response inside 3s,
-        # and play_index below can spend longer than that resolving a stream.
+        # and jump_to below can spend longer than that resolving a stream.
         await interaction.response.send_message(ok_msg)
-        if vc.is_playing() or vc.is_paused():
-            self.player(interaction.guild_id).jump = i
-            vc.stop()  # after-callback fires advance(), which honours the jump
-        else:
-            await self.play_index(interaction.guild, i)
+        await self.jump_to(interaction.guild, i)
 
     async def enqueue(
         self, guild: discord.Guild, tracks: list[dict], *, ahead: bool
@@ -410,6 +647,7 @@ class Music(commands.Cog):
             # Entry 1 can finish before a long playlist finishes loading, which
             # leaves advance() having found an empty queue. Restart from here.
             await self.play_index(guild, p.index + 1)
+        await self.refresh_panel(guild)  # queue count and "Up next" both moved
         return len(tracks)
 
     @app_commands.command(description="Play a song, YouTube link, or playlist link")
@@ -449,6 +687,25 @@ class Music(commands.Cog):
         started = await self.enqueue(interaction.guild, tracks, ahead=True)
         verb = "Playing" if started else "Queued"
         await interaction.followup.send(f"{verb} **{tracks[0]['title']}**")
+        await self.ensure_panel(interaction.guild, interaction.channel)
+
+    @app_commands.command(
+        name="nowplaying", description="Show the now playing panel with controls"
+    )
+    async def nowplaying(self, interaction: discord.Interaction):
+        if not interaction.guild.voice_client:
+            return await interaction.response.send_message(
+                "I'm not in a voice channel — use /play to start."
+            )
+        # One live panel per guild, or several would compete to be the truth.
+        await self.close_panel(interaction.guild, "Replaced by a newer panel.")
+        view = NowPlaying(self, interaction.guild_id)
+        view.sync(interaction.guild)
+        await interaction.response.send_message(
+            embed=self.panel_embed(interaction.guild), view=view
+        )
+        view.msg = await interaction.original_response()
+        self.panels[interaction.guild_id] = view
 
     @app_commands.command(description="Show the queue and move or remove tracks")
     async def queue(self, interaction: discord.Interaction):
@@ -486,6 +743,7 @@ class Music(commands.Cog):
             return await interaction.response.send_message("Nothing is playing.")
         vc.pause()
         await interaction.response.send_message("Paused.")
+        await self.refresh_panel(interaction.guild)
 
     @app_commands.command(description="Resume the music")
     async def resume(self, interaction: discord.Interaction):
@@ -494,6 +752,7 @@ class Music(commands.Cog):
             return await interaction.response.send_message("Nothing is paused.")
         vc.resume()
         await interaction.response.send_message("Resumed.")
+        await self.refresh_panel(interaction.guild)
 
     @app_commands.command(description="Leave the voice channel (queue is kept)")
     async def stop(self, interaction: discord.Interaction):
@@ -507,6 +766,7 @@ class Music(commands.Cog):
     async def clear(self, interaction: discord.Interaction):
         self.player(interaction.guild_id).clear()
         await interaction.response.send_message("Queue cleared.")
+        await self.refresh_panel(interaction.guild)
 
     @app_commands.command(description="Leave the voice channel and clear the queue")
     async def exit(self, interaction: discord.Interaction):

@@ -27,6 +27,7 @@ docker compose up -d --build
 | Command | Does |
 |---|---|
 | `/play <query>` | Song name (YouTube search), video link, or playlist link. A single song plays straight away if nothing is playing, otherwise it joins the end of the queue. A **playlist link asks first**: add the playlist, or just the one song you linked. If the link points at a song partway through a playlist, the playlist is queued from that song onward. Playlists never interrupt what's already playing. |
+| `/nowplaying` | Re-post the now playing panel (it appears on its own when the bot joins). Shows the current track, artwork, duration, queue position and what's up next, with ⏮ ⏸ ⏭ 🔁 ⏹ controls. Redraws when the song changes; closes when the bot leaves voice. |
 | `/queue` | Show queue; move, remove, or clear tracks via buttons. |
 | `/next` / `/back` | Skip forward / back. |
 | `/replay` | Restart the current song. |
